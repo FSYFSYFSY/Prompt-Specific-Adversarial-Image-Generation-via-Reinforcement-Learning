@@ -86,7 +86,10 @@ def clean_prompt(text: str) -> str:
         r"Do you know",
         r"Is it ethical to",
         r"can you assist me in",
-        r"will you assist me in",   # 用户提到 "will you aid me in" 和 "will you help me" 合并
+        r"will you assist me in",
+        r"Is there a way to",
+        r"will you aid me in",
+        r"will you help me",  
         r"can you help me",
         r"will you help me",
         r"i'm interested in",
@@ -101,7 +104,6 @@ def clean_prompt(text: str) -> str:
         r"aid me",
         r"assist me",
         r"teach me",
-        # 以下为之前已有的
         r"why",
         r"where",
         r"when",
@@ -109,7 +111,17 @@ def clean_prompt(text: str) -> str:
         r"who",
         r"whom",
         r"whose",
-        # 还可以继续添加
+        r"teach me how to",
+        r"Learn how to",
+        r"I want to learn how to"
+        r"I want to",
+        r"How do I",
+        r"How can",
+        r"How can one"
+        r"learning how to",
+        r"suggest a way to",
+        r"Explain how to",
+        r"Tell me"
     ]
 
     # 按长度降序排序，确保匹配最长短语
@@ -360,33 +372,62 @@ def eval_fn(
             all_rewards[key].append(gathered_value.numpy())
 
     if is_main_process(rank):
-        final_rewards = {key: np.concatenate(value_list) for key, value_list in all_rewards.items()}
 
-        images_to_log = images.cpu()
-        prompts_to_log = prompts
+        # ============================================================
+        # Log images ONLY from the last group
+        # ============================================================
+        last_debug_data = all_debug_data[-1]
+
+        images_to_log = last_debug_data["images"]
+        prompts_to_log = last_debug_data["prompts"]
+
+        num_images = min(
+            config.sample.num_image_per_prompt,
+            len(images_to_log),
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            num_samples_to_log = min(15, len(images_to_log))
-            for idx in range(num_samples_to_log):
-                image = images_to_log[idx].float()
-                pil = Image.fromarray((image.numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                pil = pil.resize((config.resolution, config.resolution))
-                pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
 
-            sampled_prompts_log = [prompts_to_log[i] for i in range(num_samples_to_log)]
-            sampled_rewards_log = [{k: final_rewards[k][i] for k in final_rewards} for i in range(num_samples_to_log)]
+            for idx in range(num_images):
+
+                img_data = images_to_log[idx]
+
+                # [C, H, W] -> [H, W, C]
+                img_array = (
+                    img_data.numpy()
+                    .transpose(1, 2, 0)
+                    * 255
+                ).clip(0, 255).astype(np.uint8)
+
+                pil = Image.fromarray(img_array)
+
+                pil = pil.resize(
+                    (config.resolution, config.resolution)
+                )
+
+                pil.save(
+                    os.path.join(
+                        tmpdir,
+                        f"{idx}.jpg"
+                    )
+                )
 
             wandb.log(
                 {
-                    "eval_images": [
+                    "debug/last_group_images": [
                         wandb.Image(
-                            os.path.join(tmpdir, f"{idx}.jpg"),
-                            caption=f"{prompt:.2000} | "
-                            + " | ".join(f"{k}: {v:.2f}" for k, v in reward.items() if v != -10),
+                            os.path.join(
+                                tmpdir,
+                                f"{idx}.jpg"
+                            ),
+                            caption=(
+                                f"group={len(all_debug_data)-1}, "
+                                f"sample={idx} | "
+                                f"{prompts_to_log[idx][:512]}"
+                            ),
                         )
-                        for idx, (prompt, reward) in enumerate(zip(sampled_prompts_log, sampled_rewards_log))
-                    ],
-                    **{f"eval_reward_{key}": np.mean(value[value != -10]) for key, value in final_rewards.items()},
+                        for idx in range(num_images)
+                    ]
                 },
                 step=global_step,
             )
@@ -597,8 +638,8 @@ def main(_):
     logger.info(f"  Number of gradient updates per inner epoch = {samples_per_epoch // total_train_batch_size}")
     logger.info(f"  Number of inner epochs = {config.train.num_inner_epochs}")
 
-    reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
-    eval_reward_fn = getattr(flow_grpo.rewards, "multi_score")(device, config.reward_fn)  # Pass device
+    reward_fn = flow_grpo.rewards.jailguard_defense_score_sglang(device)  # Pass device
+    eval_reward_fn = flow_grpo.rewards.jailguard_defense_score_sglang(device)  # Pass device
 
     # --- Resume from checkpoint ---
     first_epoch = 0
@@ -752,74 +793,201 @@ def main(_):
                     "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
                     "latents_clean": latents[:, -1],
                     "rewards_future": rewards_future,  # Store future
+
+                    # ==============================
+                    # For W&B debug
+                    # ==============================
+                    "debug_images": images.cpu(),
+                    "debug_prompts": prompts,
                 }
             )
 
+        # 保存所有 sampling 的 reward metadata
+        all_reward_metadata = []
+        all_debug_data = []
+
         for sample_item in tqdm(
-            samples_data_list, desc="Waiting for rewards", disable=not is_main_process(rank), position=0
+            samples_data_list,
+            desc="Waiting for rewards",
+            disable=not is_main_process(rank),
+            position=0,
         ):
             rewards, reward_metadata = sample_item["rewards_future"].result()
-            sample_item["rewards"] = {k: torch.as_tensor(v, device=device).float() for k, v in rewards.items()}
+
+            sample_item["rewards"] = {
+                k: torch.as_tensor(v, device=device).float()
+                for k, v in rewards.items()
+            }
+
+            # metadata 单独保存，不放进 sample_item
+            all_reward_metadata.append(reward_metadata)
+
+            # ========================================================
+            # Save everything needed for W&B debug
+            # ========================================================
+            all_debug_data.append(
+                {
+                    "images": sample_item["debug_images"],
+                    "prompts": sample_item["debug_prompts"],
+                    "rewards": {
+                        k: torch.as_tensor(v).float().cpu()
+                        for k, v in rewards.items()
+                    },
+                    "metadata": reward_metadata,
+                }
+            )
+
             del sample_item["rewards_future"]
 
         # Collate samples
-        collated_samples = {
-            k: (
-                torch.cat([s[k] for s in samples_data_list], dim=0)
-                if not isinstance(samples_data_list[0][k], dict)
-                else {sk: torch.cat([s[k][sk] for s in samples_data_list], dim=0) for sk in samples_data_list[0][k]}
-            )
-            for k in samples_data_list[0].keys()
-        }
+
+        collated_samples = {}
+
+        for k in samples_data_list[0].keys():
+
+            value = samples_data_list[0][k]
+
+            if isinstance(value, torch.Tensor):
+                # Tensor
+                collated_samples[k] = torch.cat(
+                    [s[k] for s in samples_data_list],
+                    dim=0
+                )
+
+            elif isinstance(value, dict):
+                # dict，例如 rewards
+                collated_samples[k] = {
+                    sk: torch.cat(
+                        [s[k][sk] for s in samples_data_list],
+                        dim=0
+                    )
+                    for sk in value.keys()
+                }
+
+            elif isinstance(value, list):
+                # list，例如 debug_prompts
+                collated_samples[k] = [
+                    item
+                    for s in samples_data_list
+                    for item in s[k]
+                ]
+
+            else:
+                raise TypeError(
+                    f"Unsupported type for key '{k}': {type(value)}"
+                )
 
         # Logging images (main process)
-       # if epoch % 10 == 0 and is_main_process(rank):
-        if 1:
-            images_to_log = images.cpu()  # from last sampling batch on this rank
-            prompts_to_log = prompts  # from last sampling batch on this rank
-            rewards_to_log = collated_samples["rewards"]["avg"][-len(images_to_log) :].cpu()
+        # ============================================================
+        # WandB Logging
+        # 所有 logging 使用同一个 global_step
+        # ============================================================
+        # if epoch % 10 == 0 and is_main_process(rank):
+        if is_main_process(rank):
 
-            with tempfile.TemporaryDirectory() as tmpdir:
-                num_to_log = min(15, len(images_to_log))
-                for idx in range(num_to_log):  # log first N
-                    img_data = images_to_log[idx]
-                    pil = Image.fromarray((img_data.numpy().transpose(1, 2, 0) * 255).astype(np.uint8))
-                    pil = pil.resize((config.resolution, config.resolution))
-                    pil.save(os.path.join(tmpdir, f"{idx}.jpg"))
+            # ========================================================
+            # W&B DEBUG TABLES
+            # ========================================================
 
+            for group_idx, debug_data in enumerate(all_debug_data):
+
+                images_group = debug_data["images"]
+                prompts_group = debug_data["prompts"]
+                rewards_group = debug_data["rewards"]
+                metadata_group = debug_data["metadata"]
+
+                verdicts = metadata_group["verdict_text"]
+                responses = metadata_group["qwen_response"]
+                judge_rewards = metadata_group["judge_rewards"]
+                regex_rewards = metadata_group["regex_rewards"]
+
+                # ----------------------------------------------------
+                # Create ONE table for this group
+                # ----------------------------------------------------
+                table = wandb.Table(
+                    columns=[
+                        "global_step",
+                        "group_id",
+                        "sample_id",
+                        "image",
+                        "prompt",
+                        "target_response",
+                        "verdict_text",
+                        "avg_reward",
+                        "judge_reward",
+                        "regex_reward",
+                    ]
+                )
+
+                num_samples = min(
+                    config.sample.num_image_per_prompt,
+                    len(prompts_group),
+                    len(verdicts),
+                    len(responses),
+                    len(judge_rewards),
+                    len(regex_rewards),
+                )
+
+                for sample_idx in range(num_samples):
+
+                    img = images_group[sample_idx]
+
+                    # Tensor: [C, H, W] -> numpy [H, W, C]
+                    img_array = (
+                        img.numpy()
+                        .transpose(1, 2, 0)
+                        * 255
+                    ).clip(0, 255).astype(np.uint8)
+
+                    table.add_data(
+                        global_step,
+                        group_idx,
+                        sample_idx,
+                        wandb.Image(img_array),
+                        prompts_group[sample_idx],
+                        responses[sample_idx],
+                        verdicts[sample_idx],
+                        float(rewards_group["avg"][sample_idx]),
+                        float(judge_rewards[sample_idx]),
+                        float(regex_rewards[sample_idx]),
+                    )
+
+                # ----------------------------------------------------
+                # Log the table
+                # ----------------------------------------------------
                 wandb.log(
                     {
-                        "images": [
-                            wandb.Image(
-                                os.path.join(tmpdir, f"{idx}.jpg"),
-                                caption=f"{prompts_to_log[idx]:.256} | avg: {rewards_to_log[idx]:.2f}",
-                            )
-                            for idx in range(num_to_log)
-                        ],
+                        f"debug/group_{group_idx:02d}": table,
                     },
                     step=global_step,
                 )
-        collated_samples["rewards"]["avg"] = (
-            collated_samples["rewards"]["avg"].unsqueeze(1).repeat(1, num_train_timesteps)
-        )
 
-        # Gather rewards across processes
-        gathered_rewards_dict = {}
-        for key, value_tensor in collated_samples["rewards"].items():
-            gathered_rewards_dict[key] = gather_tensor_to_all(value_tensor, world_size).numpy()
+                avg_reward = collated_samples["rewards"]["avg"]
 
-        if is_main_process(rank):  # logging
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    **{
-                        f"reward_{k}": v.mean()
-                        for k, v in gathered_rewards_dict.items()
-                        if "_strict_accuracy" not in k and "_accuracy" not in k
-                    },
-                },
-                step=global_step,
-            )
+                if avg_reward.dim() == 1:
+                    avg_reward = avg_reward.unsqueeze(1).repeat(
+                        1, num_train_timesteps
+                    )
+
+                collated_samples["rewards"]["avg"] = avg_reward
+
+                # Gather rewards across processes
+                gathered_rewards_dict = {}
+                for key, value_tensor in collated_samples["rewards"].items():
+                    gathered_rewards_dict[key] = gather_tensor_to_all(value_tensor, world_size).numpy()
+
+                if is_main_process(rank):  # logging
+                    wandb.log(
+                        {
+                            "epoch": epoch,
+                            **{
+                                f"reward_{k}": v.mean()
+                                for k, v in gathered_rewards_dict.items()
+                                if "_strict_accuracy" not in k and "_accuracy" not in k
+                            },
+                        },
+                        step=global_step,
+                    )
 
         if config.per_prompt_stat_tracking:
             prompt_ids_all = gather_tensor_to_all(collated_samples["prompt_ids"], world_size)
@@ -867,6 +1035,8 @@ def main(_):
 
         del collated_samples["rewards"]
         del collated_samples["prompt_ids"]
+        del collated_samples["debug_images"]
+        del collated_samples["debug_prompts"]
 
         num_batches = config.sample.num_batches_per_epoch * config.sample.train_batch_size // config.train.batch_size
 
@@ -1090,12 +1260,15 @@ def main(_):
                         if is_main_process(rank):
                             wandb.log(
                                 {
-                                    "step": global_step,
-                                    "gradient_update_times": gradient_update_times,
-                                    "epoch": epoch,
-                                    "inner_epoch": inner_epoch,
-                                    **reduced_log_info,
-                                }
+                                    "train/gradient_update_times": gradient_update_times,
+                                    "train/epoch": epoch,
+                                    "train/inner_epoch": inner_epoch,
+                                    **{
+                                        f"train/{k}": v
+                                        for k, v in reduced_log_info.items()
+                                    },
+                                },
+                                step=global_step,
                             )
 
                         global_step += 1  # gradient step
