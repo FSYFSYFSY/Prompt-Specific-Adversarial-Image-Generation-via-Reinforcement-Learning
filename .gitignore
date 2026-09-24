@@ -1,1 +1,63 @@
-Huggingface_Token.txt
+# ============================================================
+#  Prompt-Specific-Adversarial-Image-Generation-via-RL
+#  只保留核心代码；大文件（模型 / 训练记录）一律不提交
+# ============================================================
+
+# ---------- 模型权重（本地约 48G，绝不提交）----------
+model/
+models/
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# ---------- 训练产物 / 日志（本地约 18G）----------
+logs/
+checkpoints/
+checkpoint-*/
+wandb/
+*.wandb
+*.wandb.syncstate
+runs/
+tf-logs/
+*.log
+
+# ---------- 编译 / 缓存 ----------
+__pycache__/
+*.py[cod]
+*.so
+.eggs/
+*.egg-info/
+build/
+dist/
+.cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---------- 密钥 / 凭据（务必不要提交）----------
+.env
+.env.*
+!.env.example
+*_token*
+*Token*
+hftoken
+deepseek_token
+wandb.txt
+*.pem
+*.key
+
+# ---------- 大体积安装包 ----------
+*.whl
+*.deb
+*.tar.gz
+*.zip
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
